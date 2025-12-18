@@ -1,5 +1,6 @@
 import os
 import re
+import html as html_lib
 import textwrap
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -20,7 +21,7 @@ def get_ai_client() -> OpenAI:
 
     Required config (Streamlit secrets OR env vars):
       - OPENAI_BASE_URL  e.g. "https://<something>.services.ai.azure.com/openai/v1"
-      - OPENAI_API_KEY   e.g. the key from the Foundry 'Use this model' / 'Connections' blade
+      - OPENAI_API_KEY
       - OPENAI_MODEL     e.g. deployment name in Azure (Deployment Info → Name)
     """
     base_url = st.secrets.get("OPENAI_BASE_URL", None) or os.getenv("OPENAI_BASE_URL")
@@ -66,6 +67,14 @@ def canvas_headers(token: str) -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
+def _get_next_link(resp: requests.Response) -> Optional[str]:
+    link = resp.headers.get("Link", "")
+    for part in link.split(","):
+        if 'rel="next"' in part:
+            return part[part.find("<") + 1 : part.find(">")]
+    return None
+
+
 def get_course(base_url: str, token: str, course_id: str) -> Dict[str, Any]:
     url = f"{base_url}/api/v1/courses/{course_id}"
     resp = requests.get(url, headers=canvas_headers(token))
@@ -82,21 +91,17 @@ def get_pages(base_url: str, token: str, course_id: str, max_items: Optional[int
     while url:
         resp = requests.get(url, headers=headers, params=params)
         resp.raise_for_status()
+
         for page in resp.json():
             detail_url = f"{base_url}/api/v1/courses/{course_id}/pages/{page['url']}"
             detail_resp = requests.get(detail_url, headers=headers)
             detail_resp.raise_for_status()
             items.append(detail_resp.json())
+
             if max_items and len(items) >= max_items:
                 return items
 
-        link = resp.headers.get("Link", "")
-        next_url = None
-        for part in link.split(","):
-            if 'rel="next"' in part:
-                next_url = part[part.find("<") + 1 : part.find(">")]
-                break
-        url = next_url
+        url = _get_next_link(resp)
         params = None
 
     return items
@@ -112,16 +117,11 @@ def get_assignments(base_url: str, token: str, course_id: str, max_items: Option
         resp = requests.get(url, headers=headers, params=params)
         resp.raise_for_status()
         items.extend(resp.json())
+
         if max_items and len(items) >= max_items:
             return items[:max_items]
 
-        link = resp.headers.get("Link", "")
-        next_url = None
-        for part in link.split(","):
-            if 'rel="next"' in part:
-                next_url = part[part.find("<") + 1 : part.find(">")]
-                break
-        url = next_url
+        url = _get_next_link(resp)
         params = None
 
     return items
@@ -137,16 +137,11 @@ def get_discussions(base_url: str, token: str, course_id: str, max_items: Option
         resp = requests.get(url, headers=headers, params=params)
         resp.raise_for_status()
         items.extend(resp.json())
+
         if max_items and len(items) >= max_items:
             return items[:max_items]
 
-        link = resp.headers.get("Link", "")
-        next_url = None
-        for part in link.split(","):
-            if 'rel="next"' in part:
-                next_url = part[part.find("<") + 1 : part.find(">")]
-                break
-        url = next_url
+        url = _get_next_link(resp)
         params = None
 
     return items
@@ -174,7 +169,7 @@ def update_discussion_html(base_url: str, token: str, course_id: str, topic_id: 
 
 
 # =============================================================================
-# HTML CHUNKING + VALIDATION
+# HTML CHUNKING
 # =============================================================================
 
 def split_html_into_chunks(html: str, max_chunk_chars: int = 7000) -> List[str]:
@@ -218,7 +213,6 @@ def split_html_into_chunks(html: str, max_chunk_chars: int = 7000) -> List[str]:
 
     for n in nodes:
         n_html = str(n)
-
         is_heading = getattr(n, "name", None) in heading_names
 
         if is_heading and current_parts:
@@ -234,16 +228,65 @@ def split_html_into_chunks(html: str, max_chunk_chars: int = 7000) -> List[str]:
     return chunks or [html]
 
 
-def _normalize_visible_text(html: str) -> str:
-    soup = BeautifulSoup(html or "", "html.parser")
+# =============================================================================
+# VALIDATION (IMPROVED: fewer false "Visible text mismatch")
+# =============================================================================
 
-    # Remove non-visible content
+_ZERO_WIDTH = {
+    "\u200b",  # zero width space
+    "\u200c",  # zero width non-joiner
+    "\u200d",  # zero width joiner
+    "\ufeff",  # BOM
+}
+
+def _strip_zero_width(s: str) -> str:
+    for zw in _ZERO_WIDTH:
+        s = s.replace(zw, "")
+    return s
+
+
+def _visible_text(html: str) -> str:
+    soup = BeautifulSoup(html or "", "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
-
+    # Keep order; separator matters. Use single spaces to avoid adjacency issues.
     text = soup.get_text(separator=" ", strip=True)
-    text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def _normalize_text_lenient(s: str) -> str:
+    """
+    Lenient normalization:
+      - decode HTML entities
+      - normalize NBSP -> space
+      - remove zero-width chars
+      - collapse whitespace runs to a single space
+    This prevents false mismatches from &nbsp; / entity decoding / whitespace.
+    """
+    s = s or ""
+    s = html_lib.unescape(s)
+    s = s.replace("\xa0", " ")  # NBSP
+    s = _strip_zero_width(s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _normalize_text_strict(s: str) -> str:
+    """
+    "Strict-ish" normalization:
+      - decode entities
+      - remove zero-width chars
+      - DO NOT collapse internal whitespace fully (but normalize line breaks/tabs)
+    This is mainly for debugging signals; we still pass on lenient match.
+    """
+    s = s or ""
+    s = html_lib.unescape(s)
+    s = s.replace("\xa0", " ")
+    s = _strip_zero_width(s)
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"[ \t]+", " ", s)   # collapse spaces/tabs only
+    s = re.sub(r"\n+", "\n", s).strip()
+    return s
 
 
 def _extract_attr_set(html: str, tag: str, attr: str) -> set[str]:
@@ -256,18 +299,50 @@ def _extract_attr_set(html: str, tag: str, attr: str) -> set[str]:
     return vals
 
 
+def _diff_hint(a: str, b: str, max_len: int = 260) -> str:
+    """
+    Return a short hint of where strings diverge (for debugging in UI).
+    """
+    if a == b:
+        return ""
+    n = min(len(a), len(b))
+    idx = 0
+    while idx < n and a[idx] == b[idx]:
+        idx += 1
+    start = max(0, idx - 40)
+    end = min(max(len(a), len(b)), idx + 120)
+
+    a_snip = a[start:end]
+    b_snip = b[start:end]
+    if len(a_snip) > max_len:
+        a_snip = a_snip[:max_len] + "…"
+    if len(b_snip) > max_len:
+        b_snip = b_snip[:max_len] + "…"
+
+    return f"First divergence near char {idx}.\nORIG: {a_snip}\nNEW : {b_snip}"
+
+
 def validate_rewrite(original_html: str, rewritten_html: str) -> Dict[str, Any]:
     """
-    Validate that:
-      1) Visible text is identical (your "no content edits" requirement)
-      2) Core media/link attributes aren't lost (href/src/iframe src)
-    Returns a dict with ok flag + details.
+    Validate:
+      1) Visible text is identical under lenient normalization
+      2) Core assets aren't lost: href/src/iframe src
+
+    Note: We deliberately treat NBSP/entity/whitespace-only changes as OK
+    to reduce false negatives while still catching real text edits.
     """
-    o_text = _normalize_visible_text(original_html)
-    r_text = _normalize_visible_text(rewritten_html)
+    o_raw = _visible_text(original_html)
+    r_raw = _visible_text(rewritten_html)
 
-    ok_text = (o_text == r_text)
+    o_lenient = _normalize_text_lenient(o_raw)
+    r_lenient = _normalize_text_lenient(r_raw)
+    ok_text = (o_lenient == r_lenient)
 
+    o_strict = _normalize_text_strict(o_raw)
+    r_strict = _normalize_text_strict(r_raw)
+    ok_text_strict = (o_strict == r_strict)
+
+    # Assets
     o_hrefs = _extract_attr_set(original_html, "a", "href")
     r_hrefs = _extract_attr_set(rewritten_html, "a", "href")
 
@@ -286,10 +361,12 @@ def validate_rewrite(original_html: str, rewritten_html: str) -> Dict[str, Any]:
     return {
         "ok": bool(ok_text and ok_assets),
         "ok_text": ok_text,
+        "ok_text_strict": ok_text_strict,
         "ok_assets": ok_assets,
         "missing_hrefs": missing_hrefs[:50],
         "missing_srcs": missing_srcs[:50],
         "missing_iframes": missing_iframes[:50],
+        "text_diff_hint": "" if ok_text else _diff_hint(o_lenient, r_lenient),
     }
 
 
@@ -299,7 +376,6 @@ def validate_rewrite(original_html: str, rewritten_html: str) -> Dict[str, Any]:
 
 def build_style_guide_prompt(raw_model_context: str) -> str:
     raw_model_context = (raw_model_context or "").strip()
-
     return textwrap.dedent(
         f"""
         You are an expert Canvas + DesignPLUS HTML style analyst.
@@ -310,7 +386,7 @@ def build_style_guide_prompt(raw_model_context: str) -> str:
 
         HARD RULES:
         - Do NOT invent requirements that aren't supported by the model examples.
-        - Keep it concise, but include concrete patterns and “do/don’t” rules.
+        - Keep it concise, but include concrete patterns and do/don’t rules.
         - Focus on structure, wrappers, DesignPLUS components, CSU branding usage, accessibility patterns.
         - Do NOT rewrite any educational text; this is style-only.
         - Output plain text (not HTML), max ~1200-1800 words.
@@ -330,25 +406,21 @@ def get_or_create_style_guide(client: OpenAI, raw_model_context: str) -> str:
     if not raw_model_context:
         return ""
 
-    # If already created for this exact raw context, reuse
     existing = st.session_state.get("style_guide", "")
     existing_key = st.session_state.get("style_guide_key", "")
 
-    # a cheap fingerprint to avoid re-creating every run
     key = f"{len(raw_model_context)}:{hash(raw_model_context[:4000])}:{hash(raw_model_context[-4000:])}"
 
     if existing and existing_key == key:
         return existing
 
-    # If small enough, just use raw (but still capped) to avoid extra call
-    # (You can lower this threshold if you want.)
+    # If small enough, use directly
     if len(raw_model_context) <= 12000:
         style_guide = raw_model_context
         st.session_state["style_guide"] = style_guide
         st.session_state["style_guide_key"] = key
         return style_guide
 
-    # Otherwise, distill with a single model call
     model_name = get_model_name()
     prompt = build_style_guide_prompt(raw_model_context)
 
@@ -374,6 +446,7 @@ def build_rewrite_prompt(
     style_guide: str,
     global_instructions: str,
     html_fragment: str,
+    original_visible_text: str,
     chunk_index: int,
     chunk_total: int,
     repair_notes: Optional[str] = None,
@@ -384,16 +457,17 @@ def build_rewrite_prompt(
         """
         You are an expert Canvas HTML editor.
 
-        HARD REQUIREMENTS (must follow):
+        ABSOLUTE REQUIREMENTS (must follow):
         - Return ONLY HTML. No Markdown. No explanations.
         - Do NOT change, rewrite, paraphrase, reorder, summarize, or delete any visible text.
           The visible text content must remain EXACTLY the same as the input chunk.
+        - BEFORE you return, you must verify that the visible text in your output
+          is identical to the ORIGINAL VISIBLE TEXT provided below.
         - You MAY adjust HTML structure/wrappers/classes and add DesignPLUS structure needed for styling/accessibility,
           but you must not alter the text itself.
         - Preserve all links (href), images (src), iframes (src), file links, IDs, anchors, and data-* attributes.
-        - Use DesignPLUS styling/patterns consistent with the provided style guide / model course.
-        - Use Colorado State University branding colors where appropriate (style-only).
-        - Place all iframes within DesignPLUS accordions.
+        - Use DesignPLUS styling/patterns consistent with the provided style guide / model patterns.
+        - Place all iframes within DesignPLUS accordions (do not change iframe src).
         - Focus on styling, structure, and accessibility only.
         """
     ).strip()
@@ -424,6 +498,9 @@ def build_rewrite_prompt(
     - Title: {title}
     - Chunk: {chunk_index+1} of {chunk_total}
 
+    ORIGINAL VISIBLE TEXT (MUST MATCH EXACTLY):
+    {original_visible_text}
+
     {repair_block}
 
     ORIGINAL HTML (this chunk only):
@@ -437,11 +514,7 @@ def build_rewrite_prompt(
     return prompt
 
 
-def _rewrite_chunk(
-    client: OpenAI,
-    model_name: str,
-    prompt: str,
-) -> str:
+def _rewrite_chunk(client: OpenAI, model_name: str, prompt: str) -> str:
     resp = client.chat.completions.create(
         model=model_name,
         messages=[{"role": "user", "content": prompt}],
@@ -459,12 +532,11 @@ def rewrite_item_chunked_with_validation(
     max_repair_passes: int = 1,
 ) -> Tuple[str, Dict[str, Any]]:
     """
-    1) Chunk the original HTML
+    1) Chunk original HTML
     2) Rewrite each chunk
     3) Reassemble
     4) Validate no visible text changes + no asset loss
-    5) If fails, do a repair pass (re-run chunking and only repair failing chunks)
-    Returns (rewritten_html, validation_report)
+    5) If fails, repair failing chunks
     """
     model_name = get_model_name()
 
@@ -477,12 +549,16 @@ def rewrite_item_chunked_with_validation(
     # Progress UI per item
     chunk_progress = st.progress(0, text=f"Rewriting '{item.get('title','')}'…")
     rewritten_chunks: List[str] = []
+
+    # First pass
     for i, chunk_html in enumerate(chunks):
+        original_visible = _normalize_text_lenient(_visible_text(chunk_html))
         prompt = build_rewrite_prompt(
             item=item,
             style_guide=style_guide,
             global_instructions=global_instructions,
             html_fragment=chunk_html,
+            original_visible_text=original_visible,
             chunk_index=i,
             chunk_total=len(chunks),
         )
@@ -493,47 +569,67 @@ def rewrite_item_chunked_with_validation(
     rewritten_html = "\n".join(rewritten_chunks).strip()
     report = validate_rewrite(original_html, rewritten_html)
 
-    # Optional repair passes (target failing chunks)
+    # Repair passes
     passes = 0
     while not report["ok"] and passes < max_repair_passes:
         passes += 1
 
-        # Figure out which chunks are failing the "text unchanged" check
         failing_chunk_idxs: List[int] = []
+        chunk_reports: Dict[int, Dict[str, Any]] = {}
+
+        # Find failing chunks precisely
         for i, chunk_html in enumerate(chunks):
-            # Validate chunk-by-chunk for tighter repair targeting
             r_chunk = rewritten_chunks[i] if i < len(rewritten_chunks) else ""
             c_report = validate_rewrite(chunk_html, r_chunk)
+            chunk_reports[i] = c_report
             if not c_report["ok"]:
                 failing_chunk_idxs.append(i)
 
-        # If we can't isolate, repair all
         if not failing_chunk_idxs:
             failing_chunk_idxs = list(range(len(chunks)))
 
-        # Build a compact repair note
+        # Build repair note (global + specific hints)
         repair_notes = []
         if not report.get("ok_text", True):
-            repair_notes.append("- Visible text changed. Restore EXACT original visible text.")
+            repair_notes.append("- Visible text mismatch detected. Restore EXACT original visible text (no wording changes).")
         if report.get("missing_hrefs"):
-            repair_notes.append(f"- Missing href(s): {report['missing_hrefs'][:10]}")
+            repair_notes.append(f"- Missing href(s) must be preserved: {report['missing_hrefs'][:10]}")
         if report.get("missing_srcs"):
-            repair_notes.append(f"- Missing src(s): {report['missing_srcs'][:10]}")
+            repair_notes.append(f"- Missing src(s) must be preserved: {report['missing_srcs'][:10]}")
         if report.get("missing_iframes"):
-            repair_notes.append(f"- Missing iframe src(s): {report['missing_iframes'][:10]}")
+            repair_notes.append(f"- Missing iframe src(s) must be preserved: {report['missing_iframes'][:10]}")
         repair_notes_str = "\n".join(repair_notes).strip() or "- Validation failed. Fix issues without changing visible text."
 
         # Repair only failing chunks
         for i in failing_chunk_idxs:
             chunk_html = chunks[i]
+            original_visible = _normalize_text_lenient(_visible_text(chunk_html))
+
+            local = chunk_reports.get(i, {})
+            local_hints = []
+            if local and not local.get("ok_text", True):
+                if local.get("text_diff_hint"):
+                    local_hints.append(local["text_diff_hint"])
+            if local.get("missing_hrefs"):
+                local_hints.append(f"Missing href(s): {local['missing_hrefs'][:10]}")
+            if local.get("missing_srcs"):
+                local_hints.append(f"Missing src(s): {local['missing_srcs'][:10]}")
+            if local.get("missing_iframes"):
+                local_hints.append(f"Missing iframe src(s): {local['missing_iframes'][:10]}")
+
+            repair_notes_chunk = repair_notes_str
+            if local_hints:
+                repair_notes_chunk = repair_notes_chunk + "\n\nChunk-specific hints:\n" + "\n".join(f"- {h}" for h in local_hints)
+
             prompt = build_rewrite_prompt(
                 item=item,
                 style_guide=style_guide,
                 global_instructions=global_instructions,
                 html_fragment=chunk_html,
+                original_visible_text=original_visible,
                 chunk_index=i,
                 chunk_total=len(chunks),
-                repair_notes=repair_notes_str,
+                repair_notes=repair_notes_chunk,
             )
             rewritten_chunks[i] = _rewrite_chunk(client, model_name, prompt)
 
@@ -608,6 +704,7 @@ if st.sidebar.button("Fetch course content"):
                             "original_html": p.get("body", "") or "",
                             "rewritten_html": "",
                             "approved": False,
+                            "selected_for_rewrite": True,
                             "validation": {},
                         }
                     )
@@ -622,6 +719,7 @@ if st.sidebar.button("Fetch course content"):
                             "original_html": a.get("description", "") or "",
                             "rewritten_html": "",
                             "approved": False,
+                            "selected_for_rewrite": True,
                             "validation": {},
                         }
                     )
@@ -636,6 +734,7 @@ if st.sidebar.button("Fetch course content"):
                             "original_html": d.get("message", "") or "",
                             "rewritten_html": "",
                             "approved": False,
+                            "selected_for_rewrite": True,
                             "validation": {},
                         }
                     )
@@ -669,7 +768,7 @@ if model_source == "Paste HTML/JSON":
     )
     if st.button("Use this as model"):
         st.session_state["model_context"] = pasted or ""
-        st.session_state["style_guide"] = ""  # invalidate cached guide
+        st.session_state["style_guide"] = ""
         st.session_state["style_guide_key"] = ""
         st.success("Model context updated from pasted content.")
 
@@ -681,7 +780,7 @@ elif model_source == "Upload a file":
     if uploaded is not None and st.button("Use uploaded file as model"):
         content = uploaded.read().decode("utf-8", errors="ignore")
         st.session_state["model_context"] = content
-        st.session_state["style_guide"] = ""  # invalidate cached guide
+        st.session_state["style_guide"] = ""
         st.session_state["style_guide_key"] = ""
         st.success("Model context loaded from uploaded file.")
 
@@ -717,7 +816,7 @@ elif model_source == "Use Canvas model course":
                         model_snippets.append(f"### [discussion] {d['title']}\n{d.get('message', '')}")
 
                     st.session_state["model_context"] = "\n\n".join(model_snippets)
-                    st.session_state["style_guide"] = ""  # invalidate cached guide
+                    st.session_state["style_guide"] = ""
                     st.session_state["style_guide_key"] = ""
 
                 st.success("Model context built from Canvas model course.")
@@ -735,10 +834,10 @@ if st.session_state["model_context"]:
 
 
 # =============================================================================
-# STEP 3: CONFIGURE & RUN REWRITE
+# STEP 3: SELECT + RUN REWRITE
 # =============================================================================
 
-st.header("Step 3 – Rewrite course content with Azure OpenAI")
+st.header("Step 3 – Select items and rewrite with Azure OpenAI")
 
 global_instructions = st.text_area(
     "High-level rewrite instructions (style/structure only):",
@@ -747,6 +846,64 @@ global_instructions = st.text_area(
     key="global_instructions",
 )
 
+items = st.session_state["content_items"]
+
+st.subheader("Choose which items to rewrite")
+
+if items:
+    colf1, colf2, colf3, colf4 = st.columns([1, 1, 1, 2])
+    with colf1:
+        filter_pages = st.checkbox("Pages", value=True)
+    with colf2:
+        filter_assignments = st.checkbox("Assignments", value=True)
+    with colf3:
+        filter_discussions = st.checkbox("Discussions", value=True)
+    with colf4:
+        search = st.text_input("Search titles", value="")
+
+    cola, colb, colc = st.columns([1, 1, 3])
+    with cola:
+        if st.button("Select all shown"):
+            for it in items:
+                if ((it["type"] == "page" and filter_pages) or
+                    (it["type"] == "assignment" and filter_assignments) or
+                    (it["type"] == "discussion" and filter_discussions)):
+                    if not search or search.lower() in it.get("title", "").lower():
+                        it["selected_for_rewrite"] = True
+            st.session_state["content_items"] = items
+    with colb:
+        if st.button("Select none shown"):
+            for it in items:
+                if ((it["type"] == "page" and filter_pages) or
+                    (it["type"] == "assignment" and filter_assignments) or
+                    (it["type"] == "discussion" and filter_discussions)):
+                    if not search or search.lower() in it.get("title", "").lower():
+                        it["selected_for_rewrite"] = False
+            st.session_state["content_items"] = items
+
+    shown = 0
+    for idx, it in enumerate(items):
+        if it["type"] == "page" and not filter_pages:
+            continue
+        if it["type"] == "assignment" and not filter_assignments:
+            continue
+        if it["type"] == "discussion" and not filter_discussions:
+            continue
+        if search and search.lower() not in it.get("title", "").lower():
+            continue
+
+        shown += 1
+        it["selected_for_rewrite"] = st.checkbox(
+            f"[{it['type']}] {it.get('title', '')}",
+            value=bool(it.get("selected_for_rewrite", True)),
+            key=f"rewrite_pick_{idx}",
+        )
+
+    st.caption(f"Showing {shown} items. Only selected items will be sent to the LLM.")
+else:
+    st.info("Load course content first using the sidebar.")
+
+
 with st.expander("Advanced rewrite settings", expanded=False):
     max_chunk_chars = st.slider("Max characters per HTML chunk", 2000, 12000, 7000, 500)
     repair_passes = st.slider("Validator repair passes", 0, 2, 1, 1)
@@ -754,18 +911,24 @@ with st.expander("Advanced rewrite settings", expanded=False):
 
 can_run_rewrite = bool(st.session_state["content_items"] and st.session_state["model_context"])
 
-if st.button("Run rewrite on all items", disabled=not can_run_rewrite):
+if st.button("Run rewrite on selected items", disabled=not can_run_rewrite):
+    selected_items = [it for it in st.session_state["content_items"] if it.get("selected_for_rewrite", True)]
+    skipped_count = len(st.session_state["content_items"]) - len(selected_items)
+
+    if not selected_items:
+        st.warning("No items selected for rewrite.")
+        st.stop()
+
     client = get_ai_client()
-    items = st.session_state["content_items"]
     raw_model_context = st.session_state["model_context"]
 
-    # FIX: massive model_context -> compact style guide once, reused everywhere
+    # Fix: massive model_context -> compact style guide once, reused everywhere
     style_guide = get_or_create_style_guide(client, raw_model_context)
 
     progress = st.progress(0.0)
     status_area = st.empty()
 
-    for idx, item in enumerate(items):
+    for idx, item in enumerate(selected_items):
         status_area.write(f"Rewriting [{item['type']}] {item['title']}…")
         try:
             if item.get("original_html"):
@@ -779,6 +942,7 @@ if st.button("Run rewrite on all items", disabled=not can_run_rewrite):
                 )
                 item["rewritten_html"] = rewritten
                 item["validation"] = report
+                item.pop("rewrite_error", None)
             else:
                 item["rewritten_html"] = ""
                 item["validation"] = {"ok": True, "note": "No original HTML"}
@@ -786,11 +950,10 @@ if st.button("Run rewrite on all items", disabled=not can_run_rewrite):
             item["rewrite_error"] = str(e)
             item["validation"] = {"ok": False, "error": str(e)}
 
-        progress.progress((idx + 1) / len(items))
+        progress.progress((idx + 1) / len(selected_items))
 
-    st.session_state["content_items"] = items
     st.session_state["rewrite_done"] = True
-    status_area.write("Rewrite complete.")
+    status_area.write(f"Rewrite complete. Rewrote {len(selected_items)} item(s), skipped {skipped_count}.")
 
 
 # =============================================================================
@@ -808,17 +971,24 @@ else:
         has_rewrite = bool(item.get("rewritten_html"))
         label = f"[{item['type']}] {item['title']}"
         with st.expander(label, expanded=False):
-            val = item.get("validation") or {}
+            if not item.get("selected_for_rewrite", True) and not has_rewrite:
+                st.info("This item is currently not selected for rewrite (skipped).")
+
             if item.get("rewrite_error"):
                 st.error(f"Rewrite error: {item['rewrite_error']}")
 
+            val = item.get("validation") or {}
             if show_validation and val:
                 if val.get("ok", False):
                     st.success("Validator: OK (text preserved + assets preserved).")
+                    if val.get("ok_text_strict") is False:
+                        st.caption("Note: strict text differs (usually whitespace/entities), but lenient match passed.")
                 else:
                     st.warning("Validator: FAILED (see details below).")
                     if val.get("ok_text") is False:
-                        st.write("- Visible text mismatch")
+                        st.write("- Visible text mismatch (lenient)")
+                        if val.get("text_diff_hint"):
+                            st.code(val["text_diff_hint"])
                     if val.get("missing_hrefs"):
                         st.write(f"- Missing href(s): {val.get('missing_hrefs')[:10]}")
                     if val.get("missing_srcs"):
