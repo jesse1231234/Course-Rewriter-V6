@@ -8,7 +8,7 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 from openai import OpenAI
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 
 # =============================================================================
@@ -16,14 +16,6 @@ from bs4 import BeautifulSoup
 # =============================================================================
 
 def get_ai_client() -> OpenAI:
-    """
-    Create an OpenAI client for an Azure AI Foundry / Project endpoint.
-
-    Required config (Streamlit secrets OR env vars):
-      - OPENAI_BASE_URL  e.g. "https://<something>.services.ai.azure.com/openai/v1"
-      - OPENAI_API_KEY
-      - OPENAI_MODEL     e.g. deployment name in Azure (Deployment Info → Name)
-    """
     base_url = st.secrets.get("OPENAI_BASE_URL", None) or os.getenv("OPENAI_BASE_URL")
     api_key = st.secrets.get("OPENAI_API_KEY", None) or os.getenv("OPENAI_API_KEY")
     if not base_url or not api_key:
@@ -32,7 +24,6 @@ def get_ai_client() -> OpenAI:
             "Please set OPENAI_BASE_URL and OPENAI_API_KEY in Streamlit secrets or environment."
         )
         st.stop()
-
     return OpenAI(base_url=base_url, api_key=api_key)
 
 
@@ -169,19 +160,130 @@ def update_discussion_html(base_url: str, token: str, course_id: str, topic_id: 
 
 
 # =============================================================================
+# DESIGNPLUS: Deterministic iframe -> accordion enforcement
+# =============================================================================
+
+DP_ACCORDION_WRAPPER_CLASS = "dp-panels-wrapper dp-accordion-default"
+DP_PANEL_GROUP_CLASS = "dp-panel-group"
+DP_PANEL_HEADING_CLASS = "dp-panel-heading"
+DP_PANEL_CONTENT_CLASS = "dp-panel-content"
+DP_EMBED_WRAPPER_CLASS = "dp-embed-wrapper"
+
+
+def _is_inside_dp_accordion(tag: Tag) -> bool:
+    """
+    True if tag is inside a dp-panels-wrapper container.
+    """
+    p = tag.parent
+    while p is not None:
+        if isinstance(p, Tag):
+            cls = " ".join(p.get("class", [])).strip()
+            if "dp-panels-wrapper" in cls.split():
+                return True
+            if "dp-panels-wrapper" in cls:  # covers multi-class string join cases
+                return True
+        p = p.parent
+    return False
+
+
+def _make_dp_accordion_from_iframes(soup: BeautifulSoup, iframes: List[Tag], title_prefix: str = "Panel") -> Tag:
+    """
+    Build a dp-panels-wrapper accordion where each iframe becomes its own panel.
+    Uses the canonical structure you provided.
+    """
+    wrapper = soup.new_tag("div")
+    wrapper["class"] = DP_ACCORDION_WRAPPER_CLASS.split()
+
+    for idx, iframe in enumerate(iframes, start=1):
+        panel_group = soup.new_tag("div")
+        panel_group["class"] = [DP_PANEL_GROUP_CLASS]
+
+        heading = soup.new_tag("h3")
+        heading["class"] = [DP_PANEL_HEADING_CLASS]
+        heading.string = f"{title_prefix} {idx}"
+
+        content = soup.new_tag("div")
+        content["class"] = [DP_PANEL_CONTENT_CLASS]
+
+        embed = soup.new_tag("div")
+        embed["class"] = [DP_EMBED_WRAPPER_CLASS]
+
+        # Move iframe into embed wrapper (preserve attributes)
+        iframe.extract()
+        embed.append(iframe)
+
+        content.append(embed)
+        panel_group.append(heading)
+        panel_group.append(content)
+        wrapper.append(panel_group)
+
+    return wrapper
+
+
+def enforce_iframes_in_dp_accordions(html: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    Deterministically wrap any iframe(s) not already in a dp accordion into a canonical dp accordion.
+    If multiple orphan iframes exist in one container, they will be grouped into a single accordion.
+    """
+    html = (html or "").strip()
+    if not html:
+        return html, {"wrapped_iframes": 0, "grouped_accordions_created": 0}
+
+    soup = BeautifulSoup(html, "html.parser")
+    root = soup.body if soup.body else soup
+
+    # Find orphan iframes (not already in dp accordion)
+    orphan_iframes = []
+    for iframe in root.find_all("iframe"):
+        if not _is_inside_dp_accordion(iframe):
+            orphan_iframes.append(iframe)
+
+    if not orphan_iframes:
+        return str(root), {"wrapped_iframes": 0, "grouped_accordions_created": 0}
+
+    # Strategy: group orphans by their nearest reasonable container (parent block),
+    # so we don't pull iframes from entirely unrelated places into one accordion.
+    grouped: Dict[int, List[Tag]] = {}
+    for iframe in orphan_iframes:
+        parent = iframe.parent
+        # choose a stable ancestor that is a block-ish element
+        while parent and isinstance(parent, Tag) and parent.name in {"span", "strong", "em", "b", "i"}:
+            parent = parent.parent
+        key = id(parent) if parent else id(root)
+        grouped.setdefault(key, []).append(iframe)
+
+    created = 0
+    wrapped = 0
+
+    for _, iframes in grouped.items():
+        if not iframes:
+            continue
+
+        # Insert accordion before the first iframe in the group
+        first = iframes[0]
+        acc = _make_dp_accordion_from_iframes(soup, iframes, title_prefix="Panel")
+
+        first.insert_before(acc)
+        created += 1
+        wrapped += len(iframes)
+
+    # Add a spacer like your example (optional, but matches style)
+    # We'll add <p>&nbsp;</p> after each accordion we created if not already present.
+    for acc in root.find_all("div", class_=lambda c: c and "dp-panels-wrapper" in c):
+        nxt = acc.find_next_sibling()
+        if not (isinstance(nxt, Tag) and nxt.name == "p" and "&nbsp;" in str(nxt)):
+            spacer = soup.new_tag("p")
+            spacer.string = "\xa0"
+            acc.insert_after(spacer)
+
+    return str(root), {"wrapped_iframes": wrapped, "grouped_accordions_created": created}
+
+
+# =============================================================================
 # HTML CHUNKING
 # =============================================================================
 
 def split_html_into_chunks(html: str, max_chunk_chars: int = 7000) -> List[str]:
-    """
-    Split HTML into chunks without cutting through tags.
-
-    Strategy:
-      - Parse into a soup fragment
-      - Walk top-level nodes
-      - Prefer starting a new chunk at headings (h1-h6)
-      - Enforce approximate max char size by grouping nodes
-    """
     html = (html or "").strip()
     if not html:
         return [""]
@@ -199,7 +301,6 @@ def split_html_into_chunks(html: str, max_chunk_chars: int = 7000) -> List[str]:
         return [html]
 
     heading_names = {"h1", "h2", "h3", "h4", "h5", "h6"}
-
     chunks: List[str] = []
     current_parts: List[str] = []
     current_len = 0
@@ -214,13 +315,10 @@ def split_html_into_chunks(html: str, max_chunk_chars: int = 7000) -> List[str]:
     for n in nodes:
         n_html = str(n)
         is_heading = getattr(n, "name", None) in heading_names
-
         if is_heading and current_parts:
             flush()
-
         if current_len + len(n_html) > max_chunk_chars and current_parts:
             flush()
-
         current_parts.append(n_html)
         current_len += len(n_html)
 
@@ -229,15 +327,19 @@ def split_html_into_chunks(html: str, max_chunk_chars: int = 7000) -> List[str]:
 
 
 # =============================================================================
-# VALIDATION (IMPROVED: fewer false "Visible text mismatch")
+# VALIDATION
 # =============================================================================
 
-_ZERO_WIDTH = {
-    "\u200b",  # zero width space
-    "\u200c",  # zero width non-joiner
-    "\u200d",  # zero width joiner
-    "\ufeff",  # BOM
-}
+_ZERO_WIDTH = {"\u200b", "\u200c", "\u200d", "\ufeff"}
+
+LEGACY_CLASS_PATTERNS = [
+    r"\bdesigntools\b",
+    r"\bdt-",
+    r"\bdesign-tools\b",
+    r"\bcanvas-styler\b",
+    r"\btoolkit\b",
+]
+
 
 def _strip_zero_width(s: str) -> str:
     for zw in _ZERO_WIDTH:
@@ -249,43 +351,15 @@ def _visible_text(html: str) -> str:
     soup = BeautifulSoup(html or "", "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
-    # Keep order; separator matters. Use single spaces to avoid adjacency issues.
-    text = soup.get_text(separator=" ", strip=True)
-    return text
+    return soup.get_text(separator=" ", strip=True)
 
 
 def _normalize_text_lenient(s: str) -> str:
-    """
-    Lenient normalization:
-      - decode HTML entities
-      - normalize NBSP -> space
-      - remove zero-width chars
-      - collapse whitespace runs to a single space
-    This prevents false mismatches from &nbsp; / entity decoding / whitespace.
-    """
-    s = s or ""
-    s = html_lib.unescape(s)
-    s = s.replace("\xa0", " ")  # NBSP
-    s = _strip_zero_width(s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _normalize_text_strict(s: str) -> str:
-    """
-    "Strict-ish" normalization:
-      - decode entities
-      - remove zero-width chars
-      - DO NOT collapse internal whitespace fully (but normalize line breaks/tabs)
-    This is mainly for debugging signals; we still pass on lenient match.
-    """
     s = s or ""
     s = html_lib.unescape(s)
     s = s.replace("\xa0", " ")
     s = _strip_zero_width(s)
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-    s = re.sub(r"[ \t]+", " ", s)   # collapse spaces/tabs only
-    s = re.sub(r"\n+", "\n", s).strip()
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
@@ -299,79 +373,65 @@ def _extract_attr_set(html: str, tag: str, attr: str) -> set[str]:
     return vals
 
 
-def _diff_hint(a: str, b: str, max_len: int = 260) -> str:
+def _find_legacy_leakage(html: str) -> List[str]:
     """
-    Return a short hint of where strings diverge (for debugging in UI).
+    Return list of matched legacy patterns found in the HTML.
     """
-    if a == b:
-        return ""
-    n = min(len(a), len(b))
-    idx = 0
-    while idx < n and a[idx] == b[idx]:
-        idx += 1
-    start = max(0, idx - 40)
-    end = min(max(len(a), len(b)), idx + 120)
+    hits = []
+    for pat in LEGACY_CLASS_PATTERNS:
+        if re.search(pat, html, flags=re.IGNORECASE):
+            hits.append(pat)
+    return hits
 
-    a_snip = a[start:end]
-    b_snip = b[start:end]
-    if len(a_snip) > max_len:
-        a_snip = a_snip[:max_len] + "…"
-    if len(b_snip) > max_len:
-        b_snip = b_snip[:max_len] + "…"
 
-    return f"First divergence near char {idx}.\nORIG: {a_snip}\nNEW : {b_snip}"
+def _all_iframes_in_dp_accordions(html: str) -> bool:
+    soup = BeautifulSoup(html or "", "html.parser")
+    root = soup.body if soup.body else soup
+    for iframe in root.find_all("iframe"):
+        if not _is_inside_dp_accordion(iframe):
+            return False
+    return True
 
 
 def validate_rewrite(original_html: str, rewritten_html: str) -> Dict[str, Any]:
-    """
-    Validate:
-      1) Visible text is identical under lenient normalization
-      2) Core assets aren't lost: href/src/iframe src
-
-    Note: We deliberately treat NBSP/entity/whitespace-only changes as OK
-    to reduce false negatives while still catching real text edits.
-    """
-    o_raw = _visible_text(original_html)
-    r_raw = _visible_text(rewritten_html)
-
-    o_lenient = _normalize_text_lenient(o_raw)
-    r_lenient = _normalize_text_lenient(r_raw)
-    ok_text = (o_lenient == r_lenient)
-
-    o_strict = _normalize_text_strict(o_raw)
-    r_strict = _normalize_text_strict(r_raw)
-    ok_text_strict = (o_strict == r_strict)
+    o_text = _normalize_text_lenient(_visible_text(original_html))
+    r_text = _normalize_text_lenient(_visible_text(rewritten_html))
+    ok_text = (o_text == r_text)
 
     # Assets
     o_hrefs = _extract_attr_set(original_html, "a", "href")
     r_hrefs = _extract_attr_set(rewritten_html, "a", "href")
-
     o_srcs = _extract_attr_set(original_html, "img", "src") | _extract_attr_set(original_html, "source", "src")
     r_srcs = _extract_attr_set(rewritten_html, "img", "src") | _extract_attr_set(rewritten_html, "source", "src")
-
     o_iframes = _extract_attr_set(original_html, "iframe", "src")
     r_iframes = _extract_attr_set(rewritten_html, "iframe", "src")
 
     missing_hrefs = sorted(list(o_hrefs - r_hrefs))
     missing_srcs = sorted(list(o_srcs - r_srcs))
     missing_iframes = sorted(list(o_iframes - r_iframes))
-
     ok_assets = (len(missing_hrefs) == 0 and len(missing_srcs) == 0 and len(missing_iframes) == 0)
 
+    # Structural rules
+    legacy_hits = _find_legacy_leakage(rewritten_html)
+    ok_no_legacy = (len(legacy_hits) == 0)
+
+    ok_iframes_wrapped = _all_iframes_in_dp_accordions(rewritten_html)
+
     return {
-        "ok": bool(ok_text and ok_assets),
+        "ok": bool(ok_text and ok_assets and ok_no_legacy and ok_iframes_wrapped),
         "ok_text": ok_text,
-        "ok_text_strict": ok_text_strict,
         "ok_assets": ok_assets,
+        "ok_no_legacy": ok_no_legacy,
+        "ok_iframes_wrapped": ok_iframes_wrapped,
         "missing_hrefs": missing_hrefs[:50],
         "missing_srcs": missing_srcs[:50],
         "missing_iframes": missing_iframes[:50],
-        "text_diff_hint": "" if ok_text else _diff_hint(o_lenient, r_lenient),
+        "legacy_hits": legacy_hits,
     }
 
 
 # =============================================================================
-# STYLE GUIDE (FIX MASSIVE MODEL_CONTEXT)
+# STYLE GUIDE (FIX MASSIVE MODEL_CONTEXT) — DESIGNPLUS-ONLY
 # =============================================================================
 
 def build_style_guide_prompt(raw_model_context: str) -> str:
@@ -381,13 +441,17 @@ def build_style_guide_prompt(raw_model_context: str) -> str:
         You are an expert Canvas + DesignPLUS HTML style analyst.
 
         TASK:
-        Distill the following "model course/style examples" into a compact, actionable STYLE GUIDE
-        that another assistant can follow when rewriting Canvas HTML.
+        Distill the following "model course/style examples" into a compact, actionable STYLE GUIDE.
+
+        CRITICAL:
+        - Extract ONLY DesignPLUS patterns.
+        - If any legacy DesignTools patterns appear, IGNORE them and DO NOT include them.
+        - The output guide must explicitly say "DesignPLUS only" and list common legacy tokens to avoid.
 
         HARD RULES:
         - Do NOT invent requirements that aren't supported by the model examples.
         - Keep it concise, but include concrete patterns and do/don’t rules.
-        - Focus on structure, wrappers, DesignPLUS components, CSU branding usage, accessibility patterns.
+        - Focus on structure, wrappers, DesignPLUS components, accessibility patterns.
         - Do NOT rewrite any educational text; this is style-only.
         - Output plain text (not HTML), max ~1200-1800 words.
 
@@ -398,23 +462,17 @@ def build_style_guide_prompt(raw_model_context: str) -> str:
 
 
 def get_or_create_style_guide(client: OpenAI, raw_model_context: str) -> str:
-    """
-    If raw model context is huge, create a compact style guide once and reuse it for every chunk.
-    Stored in session_state["style_guide"].
-    """
     raw_model_context = (raw_model_context or "").strip()
     if not raw_model_context:
         return ""
 
     existing = st.session_state.get("style_guide", "")
     existing_key = st.session_state.get("style_guide_key", "")
-
     key = f"{len(raw_model_context)}:{hash(raw_model_context[:4000])}:{hash(raw_model_context[-4000:])}"
 
     if existing and existing_key == key:
         return existing
 
-    # If small enough, use directly
     if len(raw_model_context) <= 12000:
         style_guide = raw_model_context
         st.session_state["style_guide"] = style_guide
@@ -424,7 +482,7 @@ def get_or_create_style_guide(client: OpenAI, raw_model_context: str) -> str:
     model_name = get_model_name()
     prompt = build_style_guide_prompt(raw_model_context)
 
-    with st.spinner("Distilling model course into a compact style guide…"):
+    with st.spinner("Distilling model course into a compact DesignPLUS-only style guide…"):
         resp = client.chat.completions.create(
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
@@ -438,7 +496,7 @@ def get_or_create_style_guide(client: OpenAI, raw_model_context: str) -> str:
 
 
 # =============================================================================
-# OPENAI REWRITE (CHUNKED + VALIDATOR PASS)
+# OPENAI REWRITE (CHUNKED) + POSTPROCESS ENFORCEMENT
 # =============================================================================
 
 def build_rewrite_prompt(
@@ -449,7 +507,6 @@ def build_rewrite_prompt(
     original_visible_text: str,
     chunk_index: int,
     chunk_total: int,
-    repair_notes: Optional[str] = None,
 ) -> str:
     style_guide = (style_guide or "").strip()
 
@@ -459,15 +516,12 @@ def build_rewrite_prompt(
 
         ABSOLUTE REQUIREMENTS (must follow):
         - Return ONLY HTML. No Markdown. No explanations.
+        - DesignPLUS ONLY. Do NOT emit legacy DesignTools markup/classes.
         - Do NOT change, rewrite, paraphrase, reorder, summarize, or delete any visible text.
           The visible text content must remain EXACTLY the same as the input chunk.
-        - BEFORE you return, you must verify that the visible text in your output
-          is identical to the ORIGINAL VISIBLE TEXT provided below.
-        - You MAY adjust HTML structure/wrappers/classes and add DesignPLUS structure needed for styling/accessibility,
-          but you must not alter the text itself.
         - Preserve all links (href), images (src), iframes (src), file links, IDs, anchors, and data-* attributes.
-        - Use DesignPLUS styling/patterns consistent with the provided style guide / model patterns.
-        - Place all iframes within DesignPLUS accordions (do not change iframe src).
+        - IMPORTANT: Do NOT attempt to invent custom accordion HTML for iframes.
+          Iframes will be wrapped deterministically after rewrite. Keep iframe tags intact.
         - Focus on styling, structure, and accessibility only.
         """
     ).strip()
@@ -475,22 +529,13 @@ def build_rewrite_prompt(
     item_type = item.get("type", "page")
     title = item.get("title", "")
 
-    repair_block = ""
-    if repair_notes:
-        repair_block = textwrap.dedent(
-            f"""
-            VALIDATION FAILURES TO FIX (do not ignore):
-            {repair_notes}
-            """
-        ).strip()
-
     prompt = f"""
     {base_rules}
 
     GLOBAL INSTRUCTIONS (from user):
-    {global_instructions or "Align structure and styling to the model style guide. Do not change visible text."}
+    {global_instructions or "Align structure and styling to the DesignPLUS style guide. Do not change visible text."}
 
-    STYLE GUIDE / MODEL PATTERNS (condensed):
+    STYLE GUIDE / MODEL PATTERNS (DesignPLUS-only):
     {style_guide}
 
     TARGET ITEM:
@@ -501,13 +546,11 @@ def build_rewrite_prompt(
     ORIGINAL VISIBLE TEXT (MUST MATCH EXACTLY):
     {original_visible_text}
 
-    {repair_block}
-
     ORIGINAL HTML (this chunk only):
     {html_fragment}
 
     OUTPUT:
-    Rewrite ONLY this chunk's HTML to match the style guide and global instructions.
+    Rewrite ONLY this chunk's HTML to match the style guide and instructions.
     Return ONLY the rewritten HTML for this chunk.
     """.strip()
 
@@ -523,34 +566,23 @@ def _rewrite_chunk(client: OpenAI, model_name: str, prompt: str) -> str:
     return (resp.choices[0].message.content or "").strip()
 
 
-def rewrite_item_chunked_with_validation(
+def rewrite_item_chunked_with_postprocess(
     client: OpenAI,
     item: Dict[str, Any],
     style_guide: str,
     global_instructions: str,
     max_chunk_chars: int = 7000,
-    max_repair_passes: int = 1,
 ) -> Tuple[str, Dict[str, Any]]:
-    """
-    1) Chunk original HTML
-    2) Rewrite each chunk
-    3) Reassemble
-    4) Validate no visible text changes + no asset loss
-    5) If fails, repair failing chunks
-    """
     model_name = get_model_name()
-
     original_html = (item.get("original_html") or "").strip()
     if not original_html:
-        return "", {"ok": True, "ok_text": True, "ok_assets": True, "note": "No original HTML"}
+        return "", {"ok": True, "note": "No original HTML"}
 
     chunks = split_html_into_chunks(original_html, max_chunk_chars=max_chunk_chars)
 
-    # Progress UI per item
     chunk_progress = st.progress(0, text=f"Rewriting '{item.get('title','')}'…")
     rewritten_chunks: List[str] = []
 
-    # First pass
     for i, chunk_html in enumerate(chunks):
         original_visible = _normalize_text_lenient(_visible_text(chunk_html))
         prompt = build_rewrite_prompt(
@@ -567,77 +599,12 @@ def rewrite_item_chunked_with_validation(
         chunk_progress.progress((i + 1) / max(1, len(chunks)), text=f"Rewriting '{item.get('title','')}'… ({i+1}/{len(chunks)})")
 
     rewritten_html = "\n".join(rewritten_chunks).strip()
+
+    # Deterministic enforcement: wrap iframes after rewrite
+    rewritten_html, wrap_info = enforce_iframes_in_dp_accordions(rewritten_html)
+
     report = validate_rewrite(original_html, rewritten_html)
-
-    # Repair passes
-    passes = 0
-    while not report["ok"] and passes < max_repair_passes:
-        passes += 1
-
-        failing_chunk_idxs: List[int] = []
-        chunk_reports: Dict[int, Dict[str, Any]] = {}
-
-        # Find failing chunks precisely
-        for i, chunk_html in enumerate(chunks):
-            r_chunk = rewritten_chunks[i] if i < len(rewritten_chunks) else ""
-            c_report = validate_rewrite(chunk_html, r_chunk)
-            chunk_reports[i] = c_report
-            if not c_report["ok"]:
-                failing_chunk_idxs.append(i)
-
-        if not failing_chunk_idxs:
-            failing_chunk_idxs = list(range(len(chunks)))
-
-        # Build repair note (global + specific hints)
-        repair_notes = []
-        if not report.get("ok_text", True):
-            repair_notes.append("- Visible text mismatch detected. Restore EXACT original visible text (no wording changes).")
-        if report.get("missing_hrefs"):
-            repair_notes.append(f"- Missing href(s) must be preserved: {report['missing_hrefs'][:10]}")
-        if report.get("missing_srcs"):
-            repair_notes.append(f"- Missing src(s) must be preserved: {report['missing_srcs'][:10]}")
-        if report.get("missing_iframes"):
-            repair_notes.append(f"- Missing iframe src(s) must be preserved: {report['missing_iframes'][:10]}")
-        repair_notes_str = "\n".join(repair_notes).strip() or "- Validation failed. Fix issues without changing visible text."
-
-        # Repair only failing chunks
-        for i in failing_chunk_idxs:
-            chunk_html = chunks[i]
-            original_visible = _normalize_text_lenient(_visible_text(chunk_html))
-
-            local = chunk_reports.get(i, {})
-            local_hints = []
-            if local and not local.get("ok_text", True):
-                if local.get("text_diff_hint"):
-                    local_hints.append(local["text_diff_hint"])
-            if local.get("missing_hrefs"):
-                local_hints.append(f"Missing href(s): {local['missing_hrefs'][:10]}")
-            if local.get("missing_srcs"):
-                local_hints.append(f"Missing src(s): {local['missing_srcs'][:10]}")
-            if local.get("missing_iframes"):
-                local_hints.append(f"Missing iframe src(s): {local['missing_iframes'][:10]}")
-
-            repair_notes_chunk = repair_notes_str
-            if local_hints:
-                repair_notes_chunk = repair_notes_chunk + "\n\nChunk-specific hints:\n" + "\n".join(f"- {h}" for h in local_hints)
-
-            prompt = build_rewrite_prompt(
-                item=item,
-                style_guide=style_guide,
-                global_instructions=global_instructions,
-                html_fragment=chunk_html,
-                original_visible_text=original_visible,
-                chunk_index=i,
-                chunk_total=len(chunks),
-                repair_notes=repair_notes_chunk,
-            )
-            rewritten_chunks[i] = _rewrite_chunk(client, model_name, prompt)
-
-        rewritten_html = "\n".join(rewritten_chunks).strip()
-        report = validate_rewrite(original_html, rewritten_html)
-        report["repair_passes_used"] = passes
-        report["repaired_chunk_count"] = len(failing_chunk_idxs)
-
+    report["iframe_wrap"] = wrap_info
     return rewritten_html, report
 
 
@@ -645,34 +612,26 @@ def rewrite_item_chunked_with_validation(
 # STREAMLIT STATE INIT
 # =============================================================================
 
-if "content_items" not in st.session_state:
-    st.session_state["content_items"] = []
-
-if "model_context" not in st.session_state:
-    st.session_state["model_context"] = ""
-
-if "style_guide" not in st.session_state:
-    st.session_state["style_guide"] = ""
-
-if "style_guide_key" not in st.session_state:
-    st.session_state["style_guide_key"] = ""
-
-if "course_id" not in st.session_state:
-    st.session_state["course_id"] = None
-
-if "rewrite_done" not in st.session_state:
-    st.session_state["rewrite_done"] = False
+for k, v in {
+    "content_items": [],
+    "model_context": "",
+    "style_guide": "",
+    "style_guide_key": "",
+    "course_id": None,
+    "rewrite_done": False,
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 
 # =============================================================================
-# UI: SIDEBAR
+# UI
 # =============================================================================
 
 st.set_page_config(page_title="Canvas Course Rewriter", layout="wide")
 st.title("Canvas Course Rewriter (Streamlit)")
 
 st.sidebar.header("Canvas connection")
-
 target_course_id = st.sidebar.text_input(
     "Target course ID",
     help="Numeric ID from the Canvas course URL (e.g. .../courses/205033).",
@@ -686,7 +645,6 @@ if st.sidebar.button("Fetch course content"):
         try:
             with st.spinner("Fetching pages, assignments, and discussions from Canvas…"):
                 _ = get_course(base_url, token, target_course_id)
-
                 pages = get_pages(base_url, token, target_course_id)
                 assignments = get_assignments(base_url, token, target_course_id)
                 discussions = get_discussions(base_url, token, target_course_id)
@@ -747,11 +705,7 @@ if st.sidebar.button("Fetch course content"):
         except Exception as e:
             st.sidebar.error(f"Error fetching content: {e}")
 
-
-# =============================================================================
-# STEP 2: MODEL INPUT
-# =============================================================================
-
+# Step 2
 st.header("Step 2 – Provide model course/style")
 
 model_source = st.radio(
@@ -761,38 +715,25 @@ model_source = st.radio(
 )
 
 if model_source == "Paste HTML/JSON":
-    pasted = st.text_area(
-        "Paste HTML, JSON, or other structured description of your model course/style:",
-        height=200,
-        key="pasted_model",
-    )
+    pasted = st.text_area("Paste HTML/JSON describing model course/style:", height=200, key="pasted_model")
     if st.button("Use this as model"):
         st.session_state["model_context"] = pasted or ""
         st.session_state["style_guide"] = ""
         st.session_state["style_guide_key"] = ""
-        st.success("Model context updated from pasted content.")
+        st.success("Model context updated.")
 
 elif model_source == "Upload a file":
-    uploaded = st.file_uploader(
-        "Upload an HTML / JSON / TXT file that represents your model course/style.",
-        type=["html", "htm", "json", "txt"],
-    )
+    uploaded = st.file_uploader("Upload an HTML/JSON/TXT file for model style.", type=["html", "htm", "json", "txt"])
     if uploaded is not None and st.button("Use uploaded file as model"):
         content = uploaded.read().decode("utf-8", errors="ignore")
         st.session_state["model_context"] = content
         st.session_state["style_guide"] = ""
         st.session_state["style_guide_key"] = ""
-        st.success("Model context loaded from uploaded file.")
+        st.success("Model context loaded.")
 
 elif model_source == "Use Canvas model course":
-    model_course_id = st.text_input("Model course ID (numeric, from Canvas URL)", key="model_course_id")
-    max_model_items = st.number_input(
-        "Max items to pull from model course (total across types)",
-        min_value=3,
-        max_value=50,
-        value=10,
-        step=1,
-    )
+    model_course_id = st.text_input("Model course ID (numeric)", key="model_course_id")
+    max_model_items = st.number_input("Max model items to pull", min_value=3, max_value=50, value=10, step=1)
     if st.button("Fetch model course content"):
         if not model_course_id:
             st.error("Model course ID is required.")
@@ -804,18 +745,15 @@ elif model_source == "Use Canvas model course":
                     assignments_m = get_assignments(base_url, token, model_course_id, max_items=max_model_items)
                     discussions_m = get_discussions(base_url, token, model_course_id, max_items=max_model_items)
 
-                    model_snippets = []
-
+                    model_snips = []
                     for p in pages_m[:max_model_items]:
-                        model_snippets.append(f"### [page] {p['title']}\n{p.get('body', '')}")
-
+                        model_snips.append(f"### [page] {p['title']}\n{p.get('body', '')}")
                     for a in assignments_m[:max_model_items]:
-                        model_snippets.append(f"### [assignment] {a['name']}\n{a.get('description', '')}")
-
+                        model_snips.append(f"### [assignment] {a['name']}\n{a.get('description', '')}")
                     for d in discussions_m[:max_model_items]:
-                        model_snippets.append(f"### [discussion] {d['title']}\n{d.get('message', '')}")
+                        model_snips.append(f"### [discussion] {d['title']}\n{d.get('message', '')}")
 
-                    st.session_state["model_context"] = "\n\n".join(model_snippets)
+                    st.session_state["model_context"] = "\n\n".join(model_snips)
                     st.session_state["style_guide"] = ""
                     st.session_state["style_guide_key"] = ""
 
@@ -823,31 +761,21 @@ elif model_source == "Use Canvas model course":
             except Exception as e:
                 st.error(f"Error fetching model course: {e}")
 
-
 if st.session_state["model_context"]:
-    with st.expander("Preview current model context (trimmed)", expanded=False):
-        st.text_area(
-            "Model context preview:",
-            value=st.session_state["model_context"][:4000],
-            height=200,
-        )
+    with st.expander("Preview model context (trimmed)", expanded=False):
+        st.text_area("Model context preview:", value=st.session_state["model_context"][:4000], height=200)
 
-
-# =============================================================================
-# STEP 3: SELECT + RUN REWRITE
-# =============================================================================
-
-st.header("Step 3 – Select items and rewrite with Azure OpenAI")
+# Step 3
+st.header("Step 3 – Select items and rewrite")
 
 global_instructions = st.text_area(
     "High-level rewrite instructions (style/structure only):",
-    placeholder="E.g., standardize headings, apply CSU Online DesignPLUS layout, wrap embeds in accordions, improve accessibility structure, etc.",
+    placeholder="Standardize layout, apply DesignPLUS patterns, improve accessibility structure, etc.",
     height=150,
     key="global_instructions",
 )
 
 items = st.session_state["content_items"]
-
 st.subheader("Choose which items to rewrite")
 
 if items:
@@ -861,7 +789,7 @@ if items:
     with colf4:
         search = st.text_input("Search titles", value="")
 
-    cola, colb, colc = st.columns([1, 1, 3])
+    cola, colb, _ = st.columns([1, 1, 3])
     with cola:
         if st.button("Select all shown"):
             for it in items:
@@ -871,6 +799,7 @@ if items:
                     if not search or search.lower() in it.get("title", "").lower():
                         it["selected_for_rewrite"] = True
             st.session_state["content_items"] = items
+
     with colb:
         if st.button("Select none shown"):
             for it in items:
@@ -898,15 +827,12 @@ if items:
             value=bool(it.get("selected_for_rewrite", True)),
             key=f"rewrite_pick_{idx}",
         )
-
     st.caption(f"Showing {shown} items. Only selected items will be sent to the LLM.")
 else:
     st.info("Load course content first using the sidebar.")
 
-
 with st.expander("Advanced rewrite settings", expanded=False):
     max_chunk_chars = st.slider("Max characters per HTML chunk", 2000, 12000, 7000, 500)
-    repair_passes = st.slider("Validator repair passes", 0, 2, 1, 1)
     show_validation = st.checkbox("Show validation details per item", value=True)
 
 can_run_rewrite = bool(st.session_state["content_items"] and st.session_state["model_context"])
@@ -920,10 +846,7 @@ if st.button("Run rewrite on selected items", disabled=not can_run_rewrite):
         st.stop()
 
     client = get_ai_client()
-    raw_model_context = st.session_state["model_context"]
-
-    # Fix: massive model_context -> compact style guide once, reused everywhere
-    style_guide = get_or_create_style_guide(client, raw_model_context)
+    style_guide = get_or_create_style_guide(client, st.session_state["model_context"])
 
     progress = st.progress(0.0)
     status_area = st.empty()
@@ -931,21 +854,16 @@ if st.button("Run rewrite on selected items", disabled=not can_run_rewrite):
     for idx, item in enumerate(selected_items):
         status_area.write(f"Rewriting [{item['type']}] {item['title']}…")
         try:
-            if item.get("original_html"):
-                rewritten, report = rewrite_item_chunked_with_validation(
-                    client=client,
-                    item=item,
-                    style_guide=style_guide,
-                    global_instructions=global_instructions,
-                    max_chunk_chars=max_chunk_chars,
-                    max_repair_passes=repair_passes,
-                )
-                item["rewritten_html"] = rewritten
-                item["validation"] = report
-                item.pop("rewrite_error", None)
-            else:
-                item["rewritten_html"] = ""
-                item["validation"] = {"ok": True, "note": "No original HTML"}
+            rewritten, report = rewrite_item_chunked_with_postprocess(
+                client=client,
+                item=item,
+                style_guide=style_guide,
+                global_instructions=global_instructions,
+                max_chunk_chars=max_chunk_chars,
+            )
+            item["rewritten_html"] = rewritten
+            item["validation"] = report
+            item.pop("rewrite_error", None)
         except Exception as e:
             item["rewrite_error"] = str(e)
             item["validation"] = {"ok": False, "error": str(e)}
@@ -955,11 +873,7 @@ if st.button("Run rewrite on selected items", disabled=not can_run_rewrite):
     st.session_state["rewrite_done"] = True
     status_area.write(f"Rewrite complete. Rewrote {len(selected_items)} item(s), skipped {skipped_count}.")
 
-
-# =============================================================================
-# STEP 4: REVIEW & APPROVAL
-# =============================================================================
-
+# Step 4
 st.header("Step 4 – Review and approve changes")
 
 items = st.session_state["content_items"]
@@ -980,23 +894,23 @@ else:
             val = item.get("validation") or {}
             if show_validation and val:
                 if val.get("ok", False):
-                    st.success("Validator: OK (text preserved + assets preserved).")
-                    if val.get("ok_text_strict") is False:
-                        st.caption("Note: strict text differs (usually whitespace/entities), but lenient match passed.")
+                    st.success("Validator: OK (text preserved + assets preserved + DesignPLUS-only + iframes wrapped).")
+                    if val.get("iframe_wrap"):
+                        st.caption(f"Iframe wrap: {val['iframe_wrap']}")
                 else:
-                    st.warning("Validator: FAILED (see details below).")
+                    st.warning("Validator: FAILED")
                     if val.get("ok_text") is False:
-                        st.write("- Visible text mismatch (lenient)")
-                        if val.get("text_diff_hint"):
-                            st.code(val["text_diff_hint"])
+                        st.write("- Visible text mismatch")
                     if val.get("missing_hrefs"):
                         st.write(f"- Missing href(s): {val.get('missing_hrefs')[:10]}")
                     if val.get("missing_srcs"):
                         st.write(f"- Missing src(s): {val.get('missing_srcs')[:10]}")
                     if val.get("missing_iframes"):
                         st.write(f"- Missing iframe src(s): {val.get('missing_iframes')[:10]}")
-                    if val.get("repair_passes_used"):
-                        st.caption(f"Repair passes used: {val['repair_passes_used']}")
+                    if val.get("ok_no_legacy") is False:
+                        st.write(f"- Legacy markup detected: {val.get('legacy_hits')}")
+                    if val.get("ok_iframes_wrapped") is False:
+                        st.write("- Some iframes are NOT inside a dp-panels-wrapper accordion")
 
             col1, col2 = st.columns(2)
 
@@ -1011,15 +925,10 @@ else:
                 st.subheader("Proposed (visual)")
                 if has_rewrite:
                     components.html(item["rewritten_html"], height=350, scrolling=True)
-                    st.caption("Proposed version based on style guide + instructions.")
                 else:
                     st.warning("No rewrite available yet. Run the rewrite step above.")
 
-            approved = st.checkbox(
-                "Approve this change",
-                value=item.get("approved", False),
-                key=f"approved_{i}",
-            )
+            approved = st.checkbox("Approve this change", value=item.get("approved", False), key=f"approved_{i}")
             item["approved"] = approved
 
     st.session_state["content_items"] = items
@@ -1038,11 +947,7 @@ else:
                 it["approved"] = False
             st.info("All approvals cleared.")
 
-
-# =============================================================================
-# STEP 5: WRITE BACK TO CANVAS
-# =============================================================================
-
+# Step 5
 st.header("Step 5 – Write approved changes back to Canvas")
 
 if st.button("Write approved changes to Canvas"):
@@ -1051,10 +956,7 @@ if st.button("Write approved changes to Canvas"):
     else:
         base_url, token = get_canvas_config()
         course_id = st.session_state["course_id"]
-        approved_items = [
-            it for it in st.session_state["content_items"]
-            if it.get("approved") and it.get("rewritten_html")
-        ]
+        approved_items = [it for it in st.session_state["content_items"] if it.get("approved") and it.get("rewritten_html")]
 
         if not approved_items:
             st.warning("No approved items with rewritten HTML to write back.")
